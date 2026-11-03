@@ -10,10 +10,24 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
 #include <unordered_set>
+
+// P7 (SSD/MoE offload): when enabled, the MoE expert weight tensors are marked
+// TENSOR_READ_LAZY so that their file ranges are excluded from the eager
+// prefetch done at load time.  They then get faulted in on demand from the
+// file that holds them (e.g. an NVMe-resident shard), while every other
+// tensor is still prefetched into RAM as usual.
+static bool p7_lazy_moe_experts() {
+    static const bool enabled = []() {
+        const char * e = getenv("LLAMA_LAZY_MOE_EXPERTS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1131,6 +1145,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+
+    // P7: keep the MoE expert weights out of the prefetched region so that they
+    // are served on demand from the file that holds them (NVMe), not from RAM.
+    if (p7_lazy_moe_experts() && !(flags & TENSOR_SKIP)) {
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+                flags |= TENSOR_READ_LAZY;
+                break;
+            default:
+                break;
+        }
+    }
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };

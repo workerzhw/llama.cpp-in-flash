@@ -31,6 +31,11 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <float.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -1489,6 +1494,50 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// P7 (SSD/MoE offload): bring one expert's weight block into the page cache
+// before the dot products run.
+//
+// When the MoE expert weights live in a file that is mapped lazily (e.g. an
+// NVMe-resident shard), the first touch of every page turns into a 4 KiB
+// read.  Issuing one MADV_WILLNEED for the whole expert turns those into a
+// single large sequential read instead, which keeps the device queue busy
+// rather than starving it.
+//
+// The expert block is contiguous in the tensor (nb[2] stride), so the whole
+// expert is one contiguous byte range.
+static void p7_prefetch_expert(const char * p, size_t len) {
+#if defined(__linux__)
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char * e = getenv("LLAMA_P7_EXPERT_PREFETCH");
+        enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+
+    if (!enabled || len == 0) {
+        return;
+    }
+
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) {
+        return;
+    }
+
+    const uintptr_t mask = ~(uintptr_t)(ps - 1);
+    const uintptr_t start = ((uintptr_t) p) & mask;
+    const uintptr_t end   = (((uintptr_t) p) + len + (uintptr_t)(ps - 1)) & mask;
+
+    if (end > start) {
+        // MADV_WILLNEED is a hint: ignore failures (anonymous memory, unmapped
+        // ranges, or a range that does not cover a full page)
+        madvise((void *) start, (size_t)(end - start), MADV_WILLNEED);
+    }
+#else
+    (void) p;
+    (void) len;
+#endif
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1695,6 +1744,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+        // P7: make sure this expert is in the page cache before it is used
+        p7_prefetch_expert(src0_cur, (size_t)(nb01*ne01));
+
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
