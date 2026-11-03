@@ -31,6 +31,11 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <stdio.h>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <float.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -1489,6 +1494,394 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// P7 (SSD/MoE offload): bring one expert's weight block into the page cache
+// before the dot products run.
+//
+// When the MoE expert weights live in a file that is mapped lazily (e.g. an
+// NVMe-resident shard), the first touch of every page turns into a 4 KiB
+// read.  Issuing one MADV_WILLNEED for the whole expert turns those into a
+// single large sequential read instead, which keeps the device queue busy
+// rather than starving it.
+//
+// The expert block is contiguous in the tensor (nb[2] stride), so the whole
+// expert is one contiguous byte range.
+static void p7_prefetch_expert(const char * p, size_t len) {
+#if defined(__linux__)
+    static int enabled = -1;
+
+    if (enabled < 0) {
+        const char * e = getenv("LLAMA_P7_EXPERT_PREFETCH");
+        enabled = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+
+    if (!enabled || len == 0) {
+        return;
+    }
+
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) {
+        return;
+    }
+
+    const uintptr_t mask = ~(uintptr_t)(ps - 1);
+    const uintptr_t start = ((uintptr_t) p) & mask;
+    const uintptr_t end   = (((uintptr_t) p) + len + (uintptr_t)(ps - 1)) & mask;
+
+    if (end > start) {
+        // MADV_WILLNEED is a hint: ignore failures (anonymous memory, unmapped
+        // ranges, or a range that does not cover a full page)
+        madvise((void *) start, (size_t)(end - start), MADV_WILLNEED);
+    }
+#else
+    (void) p;
+    (void) len;
+#endif
+}
+
+// P7 (SSD/MoE offload): bounded hot-expert pool, built on the page cache.
+//
+// On boards whose RAM cannot hold the whole expert set, the kernel's LRU
+// keeps whichever experts were touched last, which is nearly random with
+// respect to what the router will ask for next.  Steer the page cache
+// explicitly instead:
+//
+//   * every use of an expert bumps a per-expert score;
+//   * every POOL_SWEEP calls the scores decay by half and the per-tensor
+//     top-K experts are re-pulled with MADV_WILLNEED (kept resident);
+//   * experts whose score decayed to zero are dropped with MADV_DONTNEED,
+//     which frees their pages for the hot set before LRU would evict the
+//     wrong ones.
+//
+// No weight data is copied - this only issues madvise() hints on the
+// file-backed mapping (MADV_DONTNEED on a shared file mapping is safe:
+// a concurrent reader just takes one extra minor/major fault).
+//
+// Enabled with LLAMA_P7_HOTPOOL=<K> where K is the number of hot experts
+// kept per expert tensor (0 = off, the default).  LLAMA_P7_HOTPOOL_SWEEP
+// overrides the sweep interval in mul_mat_id calls (default 64).
+
+struct p7_hotpool {
+    const void * base;        // src0->data of one expert tensor (one layer)
+    int          n_as;        // number of experts in the tensor
+    size_t       expert_len;  // bytes per expert block
+    uint8_t    * score;       // per-expert usage score
+    uint32_t     tick;        // calls seen for this tensor
+};
+
+#define P7_HOTPOOL_MAX 128
+static struct p7_hotpool p7_hotpools[P7_HOTPOOL_MAX];
+static int p7_n_hotpools = 0;
+
+// madvise one page-aligned range; hints only, ignore failures
+static void p7_madvise_range(const char * p, size_t len, int advice) {
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) {
+        return;
+    }
+    const uintptr_t mask = ~(uintptr_t)(ps - 1);
+    const uintptr_t start = ((uintptr_t) p) & mask;
+    const uintptr_t end   = (((uintptr_t) p) + len + (uintptr_t)(ps - 1)) & mask;
+    if (end > start) {
+        madvise((void *) start, (size_t)(end - start), advice);
+    }
+}
+
+static void p7_hotpool_tick(const void * base, int n_as, size_t expert_len, const int64_t * counts) {
+    static int pool_k = -1;
+    static int sweep  = 64;
+
+    if (pool_k < 0) {
+        const char * e = getenv("LLAMA_P7_HOTPOOL");
+        pool_k = (e != NULL && e[0] != '\0' && e[0] != '0') ? atoi(e) : 0;
+        if (pool_k > 256) {
+            pool_k = 256;
+        }
+        const char * s = getenv("LLAMA_P7_HOTPOOL_SWEEP");
+        if (s != NULL && atoi(s) > 0) {
+            sweep = atoi(s);
+        } else {
+            sweep = 8;
+        }
+    }
+
+    if (pool_k <= 0 || n_as <= 0 || expert_len == 0) {
+        return;
+    }
+
+    // find (or register) the pool state for this expert tensor
+    struct p7_hotpool * P = NULL;
+    for (int i = 0; i < p7_n_hotpools; ++i) {
+        if (p7_hotpools[i].base == base) {
+            P = &p7_hotpools[i];
+            break;
+        }
+    }
+    if (P == NULL) {
+        if (p7_n_hotpools == P7_HOTPOOL_MAX) {
+            return;
+        }
+        P = &p7_hotpools[p7_n_hotpools++];
+        P->base       = base;
+        P->n_as       = n_as;
+        P->expert_len = expert_len;
+        P->score      = (uint8_t *) calloc(n_as, 1);
+        P->tick       = 0;
+        if (P->score == NULL) {
+            --p7_n_hotpools;
+            return;
+        }
+    }
+
+    // bump the scores of the experts used in this call: recency semantics -
+    // one use makes an expert fully hot, decay does the rest
+    for (int e = 0; e < n_as; ++e) {
+        if (counts[e] > 0) {
+            P->score[e] = 255;
+        }
+    }
+
+    P->tick++;
+    if (P->tick % (uint32_t) sweep != 0) {
+        return;
+    }
+
+    // decay fast enough that a cold expert is droppable within one decode
+    // window: score 255 -> 0 takes 7 sweeps (56 calls at the default sweep
+    // of 8); drop experts at or near zero, keep the top-K warm
+    for (int e = 0; e < n_as; ++e) {
+        P->score[e] >>= 2;
+    }
+    int idx[512];
+    const int n = n_as < 512 ? n_as : 512;
+    for (int i = 0; i < n; ++i) {
+        idx[i] = i;
+    }
+    for (int i = 1; i < n; ++i) {
+        const int v = idx[i];
+        int j = i - 1;
+        while (j >= 0 && P->score[idx[j]] < P->score[v]) {
+            idx[j + 1] = idx[j];
+            --j;
+        }
+        idx[j + 1] = v;
+    }
+
+    const char * base_c = (const char *) base;
+    for (int i = 0; i < n; ++i) {
+        const int    e = idx[i];
+        const char * p = base_c + (size_t) e * P->expert_len;
+        if (i < pool_k) {
+            if (P->score[e] > 0) {
+                p7_madvise_range(p, P->expert_len, MADV_WILLNEED);
+            }
+        } else if (P->score[e] <= 3) {
+            p7_madvise_range(p, P->expert_len, MADV_DONTNEED);
+        }
+    }
+}
+
+// P7 (SSD/MoE offload): async expert prefetch service (0004).
+//
+// The inline MADV_WILLNEED above is issued by the same compute threads that
+// are about to fault on the data, so the device queue restarts cold for
+// every expert of every layer and decode degrades into a read->compute
+// serial pattern.  This service moves the waiting off the compute threads:
+// N helper threads (pinned to the idle little cores by default) drain a
+// small ring of {base, len} work items published once per mul_mat_id call,
+// warming each used expert's range (MADV_WILLNEED, then a mincore() poll
+// until the pages are resident).  The device queue then stays busy
+// continuously and the compute threads mostly touch pages that are already
+// resident.
+//
+// Enabled with LLAMA_P7_APRE=<N> (N = helper count, default 0 = exactly the
+// 0002 behaviour).  LLAMA_P7_APRE_CPUS="4,5" pins the helpers; the default
+// pins them to CPUs nth..(nth+N-1), i.e. the little cores of the usual 4+4
+// boards when llama.cpp runs with -t 4.
+//
+// Decode-only: a layer whose total routed rows exceeds 64 (prefill batches)
+// is skipped - prefill touches every expert anyway and warming it would
+// only add contention.
+//
+// The scheme only ever adds hints: if the helpers fall behind, the compute
+// threads fault as they did before, and the inline prefetch below stays
+// active as a safety net.
+
+#define P7_APRE_MAX       4
+#define P7_APRE_SLOTS     4
+#define P7_APRE_MAX_ITEMS 512
+
+struct p7_apre_item { const char * base; size_t len; };
+
+struct p7_apre_slot {
+    atomic_int state;    // 0 = free, 1 = full (items available)
+    atomic_int cursor;   // next item index helpers grab
+    atomic_int done;     // helpers-finished counter
+    int        n;
+    struct p7_apre_item items[P7_APRE_MAX_ITEMS];
+};
+
+static struct p7_apre_slot p7_apre_slots[P7_APRE_SLOTS];
+static atomic_uint         p7_apre_wp;
+static int                 p7_apre_n = -1;   // -1 = uninitialised, 0 = disabled
+
+static int p7_apre_resident(const char * p, size_t len) {
+    unsigned char vec[512];   // covers 2 MiB of 4 KiB pages
+    if (syscall(__NR_mincore, (void *) p, len, vec) != 0) {
+        return 1;   // cannot ask: assume done, never spin forever
+    }
+    const size_t npg = (len + 4095u) / 4096u;
+    for (size_t i = 0; i < npg; ++i) {
+        if (!(vec[i] & 1)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void p7_apre_wait_resident(const char * p, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        const size_t cl = (len - off < (size_t)512*4096) ? (len - off) : (size_t)512*4096;
+        while (!p7_apre_resident(p + off, cl)) {
+            sched_yield();
+        }
+        off += cl;
+    }
+}
+
+static void p7_apre_warm(const char * base, size_t len) {
+    if (len == 0) {
+        return;
+    }
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) {
+        return;
+    }
+    const uintptr_t mask  = ~(uintptr_t)(ps - 1);
+    const uintptr_t start = ((uintptr_t) base) & mask;
+    const uintptr_t end   = (((uintptr_t) base) + len + (uintptr_t)(ps - 1)) & mask;
+    if (end <= start) {
+        return;
+    }
+    madvise((void *) start, (size_t)(end - start), MADV_WILLNEED);
+    p7_apre_wait_resident((const char *) start, (size_t)(end - start));
+}
+
+static void * p7_apre_thread(void * arg) {
+    const int tid = (int)(intptr_t) arg;
+    int rp = tid;
+    for (;;) {
+        struct p7_apre_slot * s = &p7_apre_slots[rp % P7_APRE_SLOTS];
+        if (atomic_load_explicit(&s->state, memory_order_acquire) == 1) {
+            for (;;) {
+                const int i = atomic_fetch_add_explicit(&s->cursor, 1, memory_order_relaxed);
+                if (i >= s->n) {
+                    break;
+                }
+                p7_apre_warm(s->items[i].base, s->items[i].len);
+            }
+            if (atomic_fetch_add_explicit(&s->done, 1, memory_order_relaxed) == p7_apre_n - 1) {
+                atomic_store_explicit(&s->cursor, 0, memory_order_relaxed);
+                atomic_store_explicit(&s->done, 0, memory_order_relaxed);
+                atomic_store_explicit(&s->state, 0, memory_order_release);
+            }
+        } else {
+            usleep(50);
+        }
+        ++rp;
+    }
+    return NULL;
+}
+
+static void p7_apre_init(int nth) {
+    const char * e = getenv("LLAMA_P7_APRE");
+    int n = (e != NULL && e[0] >= '1' && e[0] <= '9') ? atoi(e) : 0;
+    if (n > P7_APRE_MAX) {
+        n = P7_APRE_MAX;
+    }
+    p7_apre_n = n;
+    if (n == 0) {
+        return;
+    }
+
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    const char * c = getenv("LLAMA_P7_APRE_CPUS");
+    if (c != NULL) {
+        while (*c) {
+            const int v = atoi(c);
+            if (v >= 0 && v < CPU_SETSIZE) {
+                CPU_SET(v, &cpus);
+            }
+            while (*c >= '0' && *c <= '9') {
+                ++c;
+            }
+            if (*c == ',') {
+                ++c;
+            }
+        }
+    } else {
+        for (int i = 0; i < n; ++i) {
+            const int v = nth + i;
+            if (v >= 0 && v < CPU_SETSIZE) {
+                CPU_SET(v, &cpus);
+            }
+        }
+    }
+
+    for (int i = 0; i < n; ++i) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, p7_apre_thread, (void *)(intptr_t) i) == 0) {
+            pthread_setaffinity_np(t, sizeof(cpus), &cpus);
+            pthread_detach(t);
+        }
+    }
+}
+
+static void p7_apre_publish(const char * base, int n_as, size_t expert_len,
+                            const int64_t * counts, int nth) {
+    if (p7_apre_n < 0) {
+        p7_apre_init(nth);
+    }
+    if (p7_apre_n <= 0 || expert_len == 0) {
+        return;
+    }
+
+    int64_t total = 0;
+    for (int e = 0; e < n_as; ++e) {
+        total += counts[e];
+    }
+    if (total > 64) {
+        return;   // prefill-sized batch: warming every expert would only add contention
+    }
+
+    struct p7_apre_slot * s =
+        &p7_apre_slots[atomic_fetch_add_explicit(&p7_apre_wp, 1, memory_order_relaxed) % P7_APRE_SLOTS];
+
+    // helpers normally keep up; if they do not, drop this publish rather
+    // than stall decode - the inline prefetch remains as the safety net
+    int spins = 0;
+    while (atomic_load_explicit(&s->state, memory_order_acquire) != 0) {
+        if (++spins > 2000) {
+            return;
+        }
+        sched_yield();
+    }
+
+    int n = 0;
+    for (int e = 0; e < n_as && n < P7_APRE_MAX_ITEMS; ++e) {
+        if (counts[e] > 0) {
+            s->items[n].base = base + (size_t) e * expert_len;
+            s->items[n].len  = expert_len;
+            ++n;
+        }
+    }
+    s->n = n;
+    atomic_store_explicit(&s->cursor, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->done, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->state, 1, memory_order_release);
+}
+
 static void ggml_compute_forward_mul_mat_id_one_chunk(
     struct ggml_tensor * dst,
     const struct ggml_tensor * src0,
@@ -1672,6 +2065,12 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // P7: bounded hot-expert pool (madvise-based page-cache steering)
+        p7_hotpool_tick(src0->data, (int) n_as, (size_t)(nb01*ne01), matrix_row_counts);
+
+        // P7 (0004): hand this layer's used experts to the async prefetch helpers
+        p7_apre_publish(src0->data, (int) n_as, (size_t)(nb01*ne01), matrix_row_counts, (int) nth);
     }
 
     // reset current_chunk
@@ -1695,6 +2094,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+        // P7: make sure this expert is in the page cache before it is used
+        p7_prefetch_expert(src0_cur, (size_t)(nb01*ne01));
+
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
